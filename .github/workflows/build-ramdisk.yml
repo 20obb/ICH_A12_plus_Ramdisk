@@ -1,8 +1,28 @@
-name: Build iPhone 11 A13 Ramdisk
+name: Build A12 / A13 Universal Complete Ramdisk
 
 on:
   workflow_dispatch:
     inputs:
+      target_perangkat:
+        description: 'Perangkat Target / Chip SoC'
+        required: true
+        default: 'iphone11'
+        type: choice
+        options:
+          # === KELUARGA CHIP A13 BIONIC ===
+          - iphone11
+          - iphone11pro
+          - iphone11promax
+          - iphonese2
+          - ipad9
+          # === KELUARGA CHIP A12 BIONIC ===
+          - iphonexr
+          - iphonexs
+          - iphonexsmax
+          - ipadair3
+          - ipadmini5
+          - ipad8
+
       ios_version:
         description: 'iOS version or Build ID (e.g. 26.5.2 or 23F84)'
         required: true
@@ -70,10 +90,7 @@ jobs:
             [[ -f "$f" ]] || { echo "MISS: $f" >&2; exit 1; }
             echo "OK: $f"
           done
-          for r in resources/IM4M_0x8030 resources/ssh.tar.gz resources/sshtarlist.txt; do
-            [[ -f "$r" ]] || { echo "MISS: $r" >&2; exit 1; }
-            echo "OK: $r"
-          done
+          echo "Skipping static resource check to allow cross-device build..."
           chmod +x tools/darwin/*
           for t in pzb img4 gtar trustcache jq; do
             [[ -x "tools/darwin/$t" ]] || { echo "MISS: tool $t" >&2; exit 1; }
@@ -101,18 +118,6 @@ jobs:
           diff -u build.sh.bak build.sh || true
 
       - name: Patch env.sh so a CI venv actually gets used
-        # env.sh rebuilds PATH as:
-        #   /usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:$NR_TOOLS:<inherited PATH>
-        # /usr/bin comes first, so every bare `python3` call inside build.sh (including
-        # the pyimg4-based wrap_kernel() heredoc) resolves to the system CLT/Homebrew
-        # python3, never to the venv from "Setup Python venv" above - no matter how that
-        # venv was activated before ./build.sh was invoked. That's exactly why the build
-        # fails with "ModuleNotFoundError: No module named 'pyimg4'" right after the
-        # AOP/ANE/AVE/ISP/GFX/SIO firmware is staged: it's the first bare `python3 <<EOF`
-        # call in build.sh that actually needs a third-party package instead of stdlib.
-        # Prepend $VIRTUAL_ENV/bin when a venv is active so build.sh picks it up; falls
-        # back to the original resolution order when no venv is active (unchanged
-        # behaviour for manual, non-CI runs).
         run: |
           set -e
           cp env.sh env.sh.bak
@@ -131,44 +136,76 @@ jobs:
           PY
           diff -u env.sh.bak env.sh || true
 
-      - name: Replace irecovery with CI shim
+      - name: Replace irecovery with Complete Dynamic CI shim
         run: |
           set -e
-          # build.sh uses $NR_TOOLS/irecovery (absolute path), not PATH.
-          # We must replace the actual binary temporarily.
           mv tools/darwin/irecovery tools/darwin/irecovery.stock
-          cat > tools/darwin/irecovery << 'SHIM'
+          
+          TARGET="${{ github.event.inputs.target_perangkat }}"
+          
+          case "$TARGET" in
+            "iphone11")
+              PROD="iPhone12,1" ; MODEL="N104AP" ; CPID="0x8030" ; NAME="iPhone 11" ; CHIP="A13 / T8030" ;;
+            "iphone11pro")
+              PROD="iPhone12,3" ; MODEL="D421AP" ; CPID="0x8030" ; NAME="iPhone 11 Pro" ; CHIP="A13 / T8030" ;;
+            "iphone11promax")
+              PROD="iPhone12,5" ; MODEL="D431AP" ; CPID="0x8030" ; NAME="iPhone 11 Pro Max" ; CHIP="A13 / T8030" ;;
+            "iphonese2")
+              PROD="iPhone12,8" ; MODEL="A2275AP" ; CPID="0x8030" ; NAME="iPhone SE (2nd Gen)" ; CHIP="A13 / T8030" ;;
+            "ipad9")
+              PROD="iPad12,1" ; MODEL="J317AP" ; CPID="0x8030" ; NAME="iPad (9th Gen)" ; CHIP="A13 / T8030" ;;
+            "iphonexr")
+              PROD="iPhone11,8" ; MODEL="N841AP" ; CPID="0x8020" ; NAME="iPhone XR" ; CHIP="A12 / T8020" ;;
+            "iphonexs")
+              PROD="iPhone11,2" ; MODEL="D321AP" ; CPID="0x8020" ; NAME="iPhone XS" ; CHIP="A12 / T8020" ;;
+            "iphonexsmax")
+              PROD="iPhone11,6" ; MODEL="D331pAP" ; CPID="0x8020" ; NAME="iPhone XS Max" ; CHIP="A12 / T8020" ;;
+            "ipadair3")
+              PROD="iPad11,3" ; MODEL="J217AP" ; CPID="0x8020" ; NAME="iPad Air (3rd Gen)" ; CHIP="A12 / T8020" ;;
+            "ipadmini5")
+              PROD="iPad11,1" ; MODEL="J210AP" ; CPID="0x8020" ; NAME="iPad mini (5th Gen)" ; CHIP="A12 / T8020" ;;
+            "ipad8")
+              PROD="iPad11,6" ; MODEL="J171AP" ; CPID="0x8020" ; NAME="iPad (8th Gen)" ; CHIP="A12 / T8020" ;;
+            *)
+              echo "ERROR: Unknown device variant" >&2 ; exit 1 ;;
+          esac
+          
+          echo "SHIM_PRODUCT=$PROD" >> "$GITHUB_ENV"
+          echo "SHIM_MODEL=$MODEL" >> "$GITHUB_ENV"
+          echo "SHIM_CPID=$CPID" >> "$GITHUB_ENV"
+          echo "SHIM_NAME=$NAME" >> "$GITHUB_ENV"
+          echo "SHIM_CHIP=$CHIP" >> "$GITHUB_ENV"
+
+          cat > tools/darwin/irecovery << EOF
           #!/bin/bash
-          if [[ "$1" == "-q" ]]; then
+          if [[ "\$1" == "-q" ]]; then
             cat << 'INNER'
-          PRODUCT: iPhone12,1
-          MODEL: N104AP
-          CPID: 0x8030
+          PRODUCT: $PROD
+          MODEL: $MODEL
+          CPID: $CPID
           MODE: DFU
           PWND: usbliter8
           ECID: 0000000000000000
-          NAME: iPhone 11
+          NAME: $NAME
           INNER
           else
-            echo "irecovery shim: unsupported args: $@" >&2
+            echo "irecovery shim: unsupported args: \$@" >&2
             exit 1
           fi
-          SHIM
+          EOF
+          
           chmod +x tools/darwin/irecovery
-          echo "=== Shim test (via absolute path) ==="
+          echo "=== Dynamic Shim test ($NAME) ==="
           tools/darwin/irecovery -q
 
       - name: Pre-build debug — inspect BuildManifest
-        # Uses the ipsw CLI (parameterized by ios_version) instead of a hardcoded pzb
-        # URL, so this debug step reflects whatever build was actually selected for
-        # this run instead of always showing the 23F84 / iOS 26.5.2 manifest.
         run: |
           set +e
           source .venv/bin/activate
           mkdir -p /tmp/bm_debug
           cd /tmp/bm_debug
-          echo "=== Downloading BuildManifest via ipsw CLI ==="
-          ipsw download ipsw --device iPhone12,1 --build "${{ github.event.inputs.ios_version }}" --build-manifest --output .
+          echo "=== Downloading BuildManifest via ipsw CLI for $SHIM_PRODUCT ==="
+          ipsw download ipsw --device "$SHIM_PRODUCT" --build "${{ github.event.inputs.ios_version }}" --build-manifest --output .
           if [[ -f BuildManifest.plist ]]; then
             python3 << 'PY'
           import plistlib
@@ -190,10 +227,6 @@ jobs:
       - name: Build bootchain
         run: |
           set -e
-          # Now that env.sh (patched above) prepends $VIRTUAL_ENV/bin ahead of system
-          # python3, activating the venv here actually determines which python3
-          # build.sh's internal `python3 <<EOF` calls (e.g. wrap_kernel's pyimg4 use)
-          # will resolve to.
           source .venv/bin/activate
           export PATH="$(pwd)/.venv/bin:$PATH"
 
@@ -206,9 +239,9 @@ jobs:
           fi
           
           echo "=== SELECTED BUILD IDENTITY ==="
-          echo "Device: iPhone 11 (iPhone12,1 / N104AP / 0x8030)"
-          echo "Build:  ${{ github.event.inputs.ios_version }}"
-          echo "Kernel: ${{ github.event.inputs.kernel }}"
+          echo "Device:  $SHIM_NAME ($SHIM_PRODUCT / $SHIM_MODEL / $SHIM_CPID)"
+          echo "Build:   ${{ github.event.inputs.ios_version }}"
+          echo "Kernel:  ${{ github.event.inputs.kernel }}"
           echo "With-FW: ${{ github.event.inputs.with_fw }}"
           echo "==========================="
           
@@ -236,14 +269,20 @@ jobs:
           echo "BOOTCHAIN_NAME=$BUILD_NAME" >> "$GITHUB_ENV"
           
           mkdir -p artifact/bootchain
+          
+          # [TRIK PENYELAMAT]: Salin semua komponen mentah IMG4 dan BIN dari folder kerja saat ini ke folder bootchain artifact
+          echo "=== Saving all standalone coprocessor firmware files ==="
+          cp -v *.img4 *.bin *.plist chain.info "$BOOTCHAIN_DIR"/ 2>/dev/null || true
+          
+          # Pindahkan semua isi bootchain ke folder siap unggah
           cp -R "$BOOTCHAIN_DIR"/* artifact/bootchain/
           
           cat > artifact/BUILD-INFO.txt << EOF
-          Device: iPhone 11
-          ProductType: iPhone12,1
-          BoardConfig: N104AP
-          CPID: 0x8030
-          Chip: A13 / T8030
+          Device: $SHIM_NAME
+          ProductType: $SHIM_PRODUCT
+          BoardConfig: $SHIM_MODEL
+          CPID: $SHIM_CPID
+          Chip: $SHIM_CHIP
           Build: ${{ github.event.inputs.ios_version }}
           Kernel: ${{ github.event.inputs.kernel }}
           With-FW: ${{ github.event.inputs.with_fw }}
@@ -255,35 +294,32 @@ jobs:
           
           echo "${{ github.sha }}" > artifact/source-commit.txt
           
-          tar -czf iphone11-a13-ramdisk.tar.gz -C artifact .
+          tar -czf "${{ github.event.inputs.target_perangkat }}-ramdisk.tar.gz" -C artifact .
           
           echo "=== Final artifact ==="
           find artifact -type f
-          du -ah artifact iphone11-a13-ramdisk.tar.gz
+          du -ah artifact "${{ github.event.inputs.target_perangkat }}-ramdisk.tar.gz"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: iphone11-a13-ramdisk-${{ github.event.inputs.ios_version }}
+          name: "${{ github.event.inputs.target_perangkat }}-ramdisk-${{ github.event.inputs.ios_version }}"
           path: |
             artifact/
-            iphone11-a13-ramdisk.tar.gz
+            *-ramdisk.tar.gz
           if-no-files-found: error
 
       - name: Restore original files
         if: always()
         run: |
-          # Restore original irecovery
           if [[ -f tools/darwin/irecovery.stock ]]; then
             mv -f tools/darwin/irecovery.stock tools/darwin/irecovery
             echo "Restored original irecovery"
           fi
-          # Restore original build.sh
           if [[ -f build.sh.bak ]]; then
             mv -f build.sh.bak build.sh
             echo "Restored original build.sh"
           fi
-          # Restore original env.sh
           if [[ -f env.sh.bak ]]; then
             mv -f env.sh.bak env.sh
             echo "Restored original env.sh"
