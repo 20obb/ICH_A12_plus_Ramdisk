@@ -1,10 +1,24 @@
-name: Build iPhone 11 A13 Ramdisk
+name: Build A12/A13 iPhone Ramdisk
 
 on:
   workflow_dispatch:
     inputs:
+      device:
+        description: 'Target device (A12: XR / XS / XS Max, A13: 11 / 11 Pro / 11 Pro Max / SE 2)'
+        required: true
+        default: 'iPhone 11 (iPhone12,1)'
+        type: choice
+        options:
+          - 'iPhone 11 (iPhone12,1)'
+          - 'iPhone 11 Pro (iPhone12,3)'
+          - 'iPhone 11 Pro Max (iPhone12,5)'
+          - 'iPhone SE 2nd generation (iPhone12,8)'
+          - 'iPhone XS (iPhone11,2)'
+          - 'iPhone XS Max - Global (iPhone11,6)'
+          - 'iPhone XS Max - China (iPhone11,4)'
+          - 'iPhone XR (iPhone11,8)'
       ios_version:
-        description: 'iOS version or Build ID (e.g. 26.5.2 or 23F84)'
+        description: 'iOS version, Build ID, or "latest" (e.g. 26.5.2 or 23F84). XR / XS / XS Max: iOS 18.x max'
         required: true
         default: '23F84'
         type: string
@@ -22,6 +36,14 @@ on:
         default: true
         type: boolean
 
+# Inputs are passed through env vars (never interpolated into script text) so the
+# free-text ios_version field cannot inject shell code.
+env:
+  INPUT_DEVICE: ${{ github.event.inputs.device }}
+  INPUT_IOS: ${{ github.event.inputs.ios_version }}
+  INPUT_KERNEL: ${{ github.event.inputs.kernel }}
+  INPUT_WITH_FW: ${{ github.event.inputs.with_fw }}
+
 jobs:
   build:
     runs-on: macos-15
@@ -30,12 +52,91 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Resolve device profile
+        # Board / CPID values are set here explicitly (not taken from build.sh's
+        # --device table), so the bootchain always targets the exact board selected.
+        # iPhone11,4 = D331AP (China) and iPhone11,6 = D331pAP (Global).
+        run: |
+          set -euo pipefail
+          case "$INPUT_DEVICE" in
+            "iPhone 11 (iPhone12,1)")
+              P="iPhone12,1"; M="N104AP"; C="0x8030"; N="iPhone 11"; CH="A13 / T8030"; S="iphone11-a13" ;;
+            "iPhone 11 Pro (iPhone12,3)")
+              P="iPhone12,3"; M="D421AP"; C="0x8030"; N="iPhone 11 Pro"; CH="A13 / T8030"; S="iphone11pro-a13" ;;
+            "iPhone 11 Pro Max (iPhone12,5)")
+              P="iPhone12,5"; M="D431AP"; C="0x8030"; N="iPhone 11 Pro Max"; CH="A13 / T8030"; S="iphone11promax-a13" ;;
+            "iPhone SE 2nd generation (iPhone12,8)")
+              P="iPhone12,8"; M="D79AP"; C="0x8030"; N="iPhone SE (2nd generation)"; CH="A13 / T8030"; S="iphonese2-a13" ;;
+            "iPhone XS (iPhone11,2)")
+              P="iPhone11,2"; M="D321AP"; C="0x8020"; N="iPhone XS"; CH="A12 / T8020"; S="iphonexs-a12" ;;
+            "iPhone XS Max - Global (iPhone11,6)")
+              P="iPhone11,6"; M="D331pAP"; C="0x8020"; N="iPhone XS Max (Global)"; CH="A12 / T8020"; S="iphonexsmax-global-a12" ;;
+            "iPhone XS Max - China (iPhone11,4)")
+              P="iPhone11,4"; M="D331AP"; C="0x8020"; N="iPhone XS Max (China)"; CH="A12 / T8020"; S="iphonexsmax-china-a12" ;;
+            "iPhone XR (iPhone11,8)")
+              P="iPhone11,8"; M="N841AP"; C="0x8020"; N="iPhone XR"; CH="A12 / T8020"; S="iphonexr-a12" ;;
+            *)
+              echo "::error::Unknown device selection: $INPUT_DEVICE" >&2
+              exit 1 ;;
+          esac
+          {
+            echo "DEV_NAME=$N"
+            echo "DEV_PRODUCT=$P"
+            echo "DEV_MODEL=$M"
+            echo "DEV_CPID=$C"
+            echo "DEV_CHIP=$CH"
+            echo "DEV_SLUG=$S"
+          } >> "$GITHUB_ENV"
+          echo "=== Selected device ==="
+          echo "Name:    $N"
+          echo "Product: $P"
+          echo "Board:   $M"
+          echo "CPID:    $C ($CH)"
+
+      - name: Validate firmware for selected device
+        # Fails in seconds (before brew / ipsw / pzb) when the iOS version or build
+        # does not exist for this device - e.g. 23F84 (iOS 26) for an A12 iPhone XS,
+        # which tops out at iOS 18. Also resolves "latest" to a concrete Build ID.
+        run: |
+          set -euo pipefail
+          if [[ ! "$INPUT_IOS" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::ios_version contains invalid characters: $INPUT_IOS" >&2
+            exit 1
+          fi
+          curl --fail --silent --show-error --location \
+            "https://api.ipsw.me/v4/device/${DEV_PRODUCT}?type=ipsw" -o /tmp/ipsw_api.json
+          python3 - "$INPUT_IOS" << 'PY'
+          import json, os, sys
+          sel = sys.argv[1]
+          device = os.environ["DEV_PRODUCT"]
+          fws = json.load(open("/tmp/ipsw_api.json")).get("firmwares", [])
+          fws.sort(key=lambda f: f.get("releasedate") or "", reverse=True)
+          if not fws:
+              print(f"::error::ipsw.me returned no firmwares for {device}")
+              sys.exit(1)
+          if sel.lower() == "latest":
+              pick = fws[0]
+          else:
+              pick = next((f for f in fws if f.get("buildid") == sel or f.get("version") == sel), None)
+          if pick is None:
+              print(f"::error::iOS '{sel}' does not exist for {device}. Newest available builds:")
+              for f in fws[:8]:
+                  print(f"  iOS {f['version']:<10} build {f['buildid']}")
+              sys.exit(1)
+          print(f"OK: {device} -> iOS {pick['version']} ({pick['buildid']})")
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"RESOLVED_BUILD={pick['buildid']}\n")
+              env.write(f"RESOLVED_VERSION={pick['version']}\n")
+          PY
+
       - name: Show environment
         run: |
           echo "=== macOS Version ==="
           sw_vers
           echo "=== Architecture ==="
           uname -m
+          echo "=== Target ==="
+          echo "$DEV_NAME ($DEV_PRODUCT / $DEV_MODEL / $DEV_CPID) iOS $RESOLVED_VERSION ($RESOLVED_BUILD)"
           echo "=== PATH ==="
           tr ':' '\n' <<< "$PATH"
 
@@ -70,8 +171,13 @@ jobs:
             [[ -f "$f" ]] || { echo "MISS: $f" >&2; exit 1; }
             echo "OK: $f"
           done
-          for r in resources/IM4M_0x8030 resources/ssh.tar.gz resources/sshtarlist.txt; do
-            [[ -f "$r" ]] || { echo "MISS: $r" >&2; exit 1; }
+          # The IM4M ticket is per-CPID: IM4M_0x8030 (A13) or IM4M_0x8020 (A12).
+          for r in "resources/IM4M_${DEV_CPID}" resources/ssh.tar.gz resources/sshtarlist.txt; do
+            if [[ ! -f "$r" ]]; then
+              echo "MISS: $r" >&2
+              echo "::error::Missing $r (required for $DEV_NAME / CPID $DEV_CPID)" >&2
+              exit 1
+            fi
             echo "OK: $r"
           done
           chmod +x tools/darwin/*
@@ -135,22 +241,23 @@ jobs:
         run: |
           set -e
           # build.sh uses $NR_TOOLS/irecovery (absolute path), not PATH.
-          # We must replace the actual binary temporarily.
+          # We must replace the actual binary temporarily. The shim now reports the
+          # device selected in the workflow inputs (PRODUCT / MODEL / CPID / NAME).
           mv tools/darwin/irecovery tools/darwin/irecovery.stock
-          cat > tools/darwin/irecovery << 'SHIM'
+          cat > tools/darwin/irecovery << SHIM
           #!/bin/bash
-          if [[ "$1" == "-q" ]]; then
+          if [[ "\$1" == "-q" ]]; then
             cat << 'INNER'
-          PRODUCT: iPhone12,1
-          MODEL: N104AP
-          CPID: 0x8030
+          PRODUCT: ${DEV_PRODUCT}
+          MODEL: ${DEV_MODEL}
+          CPID: ${DEV_CPID}
           MODE: DFU
           PWND: usbliter8
           ECID: 0000000000000000
-          NAME: iPhone 11
+          NAME: ${DEV_NAME}
           INNER
           else
-            echo "irecovery shim: unsupported args: $@" >&2
+            echo "irecovery shim: unsupported args: \$@" >&2
             exit 1
           fi
           SHIM
@@ -159,26 +266,32 @@ jobs:
           tools/darwin/irecovery -q
 
       - name: Pre-build debug — inspect BuildManifest
-        # Uses the ipsw CLI (parameterized by ios_version) instead of a hardcoded pzb
-        # URL, so this debug step reflects whatever build was actually selected for
-        # this run instead of always showing the 23F84 / iOS 26.5.2 manifest.
+        # Uses the ipsw CLI (parameterized by the resolved build) instead of a hardcoded
+        # pzb URL, so this debug step reflects whatever device/build was actually
+        # selected for this run.
         run: |
           set +e
           source .venv/bin/activate
           mkdir -p /tmp/bm_debug
           cd /tmp/bm_debug
           echo "=== Downloading BuildManifest via ipsw CLI ==="
-          ipsw download ipsw --device iPhone12,1 --build "${{ github.event.inputs.ios_version }}" --build-manifest --output .
+          ipsw download ipsw --device "$DEV_PRODUCT" --build "$RESOLVED_BUILD" --build-manifest --output .
           if [[ -f BuildManifest.plist ]]; then
             python3 << 'PY'
-          import plistlib
+          import os, plistlib
           try:
+              board = os.environ["DEV_MODEL"].lower()
               manifest = plistlib.loads(open("BuildManifest.plist", "rb").read())
               identities = manifest.get("BuildIdentities", [])
               print("=== BUILD IDENTITIES ===")
+              hits = 0
               for i, ident in enumerate(identities):
                   info = ident.get("Info", {})
-                  print(f"Index {i}: DeviceClass={info.get('DeviceClass','N/A')} ProductType={info.get('ProductType','N/A')} BoardConfig={info.get('BoardConfig','N/A')} BuildNumber={info.get('BuildNumber','N/A')} RestoreBehavior={info.get('RestoreBehavior','N/A')}")
+                  hit = info.get("DeviceClass", "").lower() == board
+                  hits += hit
+                  mark = "   <== selected board" if hit else ""
+                  print(f"Index {i}: DeviceClass={info.get('DeviceClass','N/A')} ProductType={info.get('ProductType','N/A')} BoardConfig={info.get('BoardConfig','N/A')} BuildNumber={info.get('BuildNumber','N/A')} RestoreBehavior={info.get('RestoreBehavior','N/A')}{mark}")
+              print(f"Identities matching board {board}: {hits}")
           except Exception as e:
               print(f"Failed to parse BuildManifest: {e}")
           PY
@@ -186,6 +299,43 @@ jobs:
             echo "WARNING: Could not download BuildManifest for debug inspection"
           fi
           cd -
+
+      - name: Preflight — validate device identity and firmware components
+        # Runs build.sh --dry-run (resolves IPSW + BuildManifest, checks the board has
+        # an identity and that iBEC / DeviceTree / KernelCache / RestoreRamDisk /
+        # RestoreTrustCache exist), then additionally checks the coprocessor firmware
+        # keys that --with-fw hard-requires. Failing here is cheaper and clearer than
+        # failing mid-build.
+        run: |
+          set -e
+          source .venv/bin/activate
+          export PATH="$(pwd)/.venv/bin:$PATH"
+
+          ARGS=(--build "$RESOLVED_BUILD" --kernel "$INPUT_KERNEL" --dry-run)
+          if [[ "$INPUT_WITH_FW" == "true" ]]; then
+            ARGS+=(--with-fw)
+          else
+            ARGS+=(--no-fw)
+          fi
+
+          OUT="$(./build.sh "${ARGS[@]}" 2>&1)" || {
+            echo "$OUT"
+            echo "::error::Preflight failed for $DEV_NAME ($DEV_MODEL) build $RESOLVED_BUILD" >&2
+            exit 1
+          }
+          echo "$OUT"
+
+          if [[ "$INPUT_WITH_FW" == "true" ]]; then
+            missing=""
+            for key in AOP ANE AVE ISP GFX SIO; do
+              grep -qE "^ ${key}: " <<< "$OUT" || missing="$missing $key"
+            done
+            if [[ -n "$missing" ]]; then
+              echo "::error::BuildManifest for $DEV_NAME / $RESOLVED_BUILD is missing:$missing (required by with_fw). Re-run with with_fw=false or another build." >&2
+              exit 1
+            fi
+            echo "OK: all coprocessor firmware present (AOP ANE AVE ISP GFX SIO)"
+          fi
 
       - name: Build bootchain
         run: |
@@ -197,22 +347,21 @@ jobs:
           source .venv/bin/activate
           export PATH="$(pwd)/.venv/bin:$PATH"
 
-          ARGS="--build ${{ github.event.inputs.ios_version }}"
-          ARGS="$ARGS --kernel ${{ github.event.inputs.kernel }}"
-          if [[ "${{ github.event.inputs.with_fw }}" == "true" ]]; then
-            ARGS="$ARGS --with-fw"
+          ARGS=(--build "$RESOLVED_BUILD" --kernel "$INPUT_KERNEL")
+          if [[ "$INPUT_WITH_FW" == "true" ]]; then
+            ARGS+=(--with-fw)
           else
-            ARGS="$ARGS --no-fw"
+            ARGS+=(--no-fw)
           fi
-          
+
           echo "=== SELECTED BUILD IDENTITY ==="
-          echo "Device: iPhone 11 (iPhone12,1 / N104AP / 0x8030)"
-          echo "Build:  ${{ github.event.inputs.ios_version }}"
-          echo "Kernel: ${{ github.event.inputs.kernel }}"
-          echo "With-FW: ${{ github.event.inputs.with_fw }}"
+          echo "Device: $DEV_NAME ($DEV_PRODUCT / $DEV_MODEL / $DEV_CPID)"
+          echo "Build:  $RESOLVED_BUILD (iOS $RESOLVED_VERSION)"
+          echo "Kernel: $INPUT_KERNEL"
+          echo "With-FW: $INPUT_WITH_FW"
           echo "==========================="
-          
-          ./build.sh $ARGS
+
+          ./build.sh "${ARGS[@]}"
 
       - name: Inspect bootchain
         run: |
@@ -234,40 +383,51 @@ jobs:
           fi
           BUILD_NAME=$(basename "$BOOTCHAIN_DIR")
           echo "BOOTCHAIN_NAME=$BUILD_NAME" >> "$GITHUB_ENV"
-          
+
+          # Sanity: the staged bootchain must belong to the selected board.
+          if ! grep -qi "^model=${DEV_MODEL}$" "$BOOTCHAIN_DIR/chain.info"; then
+            echo "ERROR: chain.info board does not match selected board $DEV_MODEL" >&2
+            cat "$BOOTCHAIN_DIR/chain.info" >&2 || true
+            exit 1
+          fi
+
+          ARTIFACT_TAR="${DEV_SLUG}-ramdisk.tar.gz"
+          echo "ARTIFACT_TAR=$ARTIFACT_TAR" >> "$GITHUB_ENV"
+
           mkdir -p artifact/bootchain
           cp -R "$BOOTCHAIN_DIR"/* artifact/bootchain/
-          
+
           cat > artifact/BUILD-INFO.txt << EOF
-          Device: iPhone 11
-          ProductType: iPhone12,1
-          BoardConfig: N104AP
-          CPID: 0x8030
-          Chip: A13 / T8030
-          Build: ${{ github.event.inputs.ios_version }}
-          Kernel: ${{ github.event.inputs.kernel }}
-          With-FW: ${{ github.event.inputs.with_fw }}
+          Device: ${DEV_NAME}
+          ProductType: ${DEV_PRODUCT}
+          BoardConfig: ${DEV_MODEL}
+          CPID: ${DEV_CPID}
+          Chip: ${DEV_CHIP}
+          iOS: ${RESOLVED_VERSION}
+          Build: ${RESOLVED_BUILD}
+          Kernel: ${INPUT_KERNEL}
+          With-FW: ${INPUT_WITH_FW}
           Runner: macos-15
           Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
-          Repository: ${{ github.repository }}
-          Commit: ${{ github.sha }}
+          Repository: ${GITHUB_REPOSITORY}
+          Commit: ${GITHUB_SHA}
           EOF
-          
-          echo "${{ github.sha }}" > artifact/source-commit.txt
-          
-          tar -czf iphone11-a13-ramdisk.tar.gz -C artifact .
-          
+
+          echo "${GITHUB_SHA}" > artifact/source-commit.txt
+
+          tar -czf "$ARTIFACT_TAR" -C artifact .
+
           echo "=== Final artifact ==="
           find artifact -type f
-          du -ah artifact iphone11-a13-ramdisk.tar.gz
+          du -ah artifact "$ARTIFACT_TAR"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: iphone11-a13-ramdisk-${{ github.event.inputs.ios_version }}
+          name: ${{ env.DEV_SLUG }}-ramdisk-${{ env.RESOLVED_BUILD }}
           path: |
             artifact/
-            iphone11-a13-ramdisk.tar.gz
+            ${{ env.ARTIFACT_TAR }}
           if-no-files-found: error
 
       - name: Restore original files
