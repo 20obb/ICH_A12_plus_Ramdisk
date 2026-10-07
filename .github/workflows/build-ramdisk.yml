@@ -140,14 +140,56 @@ jobs:
           echo "=== PATH ==="
           tr ':' '\n' <<< "$PATH"
 
+      - name: Setup Python 3.12
+        # Python comes from actions/setup-python instead of Homebrew. `brew install
+        # python@3` was upgrading python@3.14 together with openssl@3, and the openssl@3
+        # `brew link` step failed on a stale /opt/homebrew/bin/openssl symlink that
+        # belongs to openssl@1.1 on the runner image, which aborted the whole job.
+        # Version is pinned so pip wheels for pyimg4 / capstone resolve predictably.
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Install system dependencies
+        # Only `ipsw` is installed from Homebrew. curl ships with macOS, python3 comes
+        # from setup-python above. HOMEBREW_NO_INSTALL_UPGRADE stops brew from upgrading
+        # already-installed (outdated) formulae and their dependencies, which is what
+        # triggered the openssl@3 link failure.
+        env:
+          HOMEBREW_NO_INSTALL_UPGRADE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_ANALYTICS: "1"
+          HOMEBREW_NO_ENV_HINTS: "1"
         run: |
           set -e
-          brew update
-          brew install ipsw curl python@3
+          # Fallback only: free the symlink that blocks openssl@3 on some runner images.
+          if brew list --versions openssl@1.1 >/dev/null 2>&1; then
+            brew unlink openssl@1.1 || true
+          fi
+
+          install_ipsw() {
+            brew install ipsw && return 0
+            # Formula may be poured but not linked; force the link before giving up.
+            brew link --overwrite ipsw 2>/dev/null && command -v ipsw >/dev/null
+          }
+
+          if ! command -v ipsw >/dev/null; then
+            ok=0
+            for attempt in 1 2 3; do
+              echo "=== brew install ipsw (attempt $attempt/3) ==="
+              if install_ipsw; then ok=1; break; fi
+              sleep $((attempt * 10))
+              brew update || true
+            done
+            [[ "$ok" == "1" ]] || { echo "::error::Could not install ipsw via Homebrew" >&2; exit 1; }
+          fi
+
           which ipsw || { echo "FAIL: ipsw not installed" >&2; exit 1; }
           which python3 || { echo "FAIL: python3 not installed" >&2; exit 1; }
+          which curl || { echo "FAIL: curl not found" >&2; exit 1; }
           echo "OK: ipsw $(ipsw version 2>/dev/null | head -1)"
+          echo "OK: $(python3 --version) at $(which python3)"
 
       - name: Setup Python venv
         run: |
@@ -325,16 +367,39 @@ jobs:
           }
           echo "$OUT"
 
+          # Coprocessor firmware check: read the BuildManifest itself (same identity
+          # selection and key names as build.sh) instead of scraping build.sh's
+          # pretty-printed output, which produced a false "missing" result.
           if [[ "$INPUT_WITH_FW" == "true" ]]; then
-            missing=""
-            for key in AOP ANE AVE ISP GFX SIO; do
-              grep -qE "^ ${key}: " <<< "$OUT" || missing="$missing $key"
-            done
-            if [[ -n "$missing" ]]; then
-              echo "::error::BuildManifest for $DEV_NAME / $RESOLVED_BUILD is missing:$missing (required by with_fw). Re-run with with_fw=false or another build." >&2
-              exit 1
+            MANIFEST_FILE="$(find "$PWD" /tmp -name BuildManifest.plist \
+              -path "*${DEV_PRODUCT}-${RESOLVED_BUILD}*" 2>/dev/null | head -1)"
+            [[ -n "$MANIFEST_FILE" ]] || MANIFEST_FILE="$(ls /tmp/bm_debug/BuildManifest.plist 2>/dev/null || true)"
+            if [[ -z "$MANIFEST_FILE" ]]; then
+              echo "::warning::BuildManifest.plist not found for the firmware check; build.sh will enforce it during the build"
+            else
+              echo "Checking firmware keys in $MANIFEST_FILE"
+              python3 - "$MANIFEST_FILE" << 'PY'
+          import os, plistlib, sys
+          board = os.environ["DEV_MODEL"].lower()
+          manifest = plistlib.load(open(sys.argv[1], "rb"))
+          identity = next((i for i in manifest["BuildIdentities"]
+                           if i.get("Info", {}).get("DeviceClass", "").lower() == board), None)
+          if identity is None:
+              print(f"::error::No BuildIdentity for board {board} in manifest")
+              sys.exit(1)
+          images = identity["Manifest"]
+          missing = []
+          for key in ("AOP", "ANE", "AVE", "ISP", "GFX", "SIO"):
+              path = images.get(key, {}).get("Info", {}).get("Path")
+              print(f"  {key}: {path or 'MISSING'}")
+              if not path:
+                  missing.append(key)
+          if missing:
+              print(f"::error::BuildManifest for {os.environ['DEV_NAME']} / {os.environ['RESOLVED_BUILD']} is missing: {' '.join(missing)} (required by with_fw). Re-run with with_fw=false or another build.")
+              sys.exit(1)
+          print("OK: all coprocessor firmware present (AOP ANE AVE ISP GFX SIO)")
+          PY
             fi
-            echo "OK: all coprocessor firmware present (AOP ANE AVE ISP GFX SIO)"
           fi
 
       - name: Build bootchain
